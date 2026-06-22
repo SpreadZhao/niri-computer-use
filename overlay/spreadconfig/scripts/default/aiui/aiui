@@ -1,0 +1,1355 @@
+#!/usr/bin/env python3
+"""Niri/Wayland computer-use control surface.
+
+This is deliberately a local policy wrapper, not a privilege boundary. Every UI
+operation updates a Waybar-readable state file, is audited, and honors pause and
+emergency-stop flags. High-risk operations require an exact, blocking user
+approval immediately before execution.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Callable, Iterable, Sequence
+
+VERSION = "2.0.0"
+SCRIPT_PATH = Path(__file__).resolve()
+POLICY_PATH = SCRIPT_PATH.with_name("policy.json")
+RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "deny": 3}
+VALID_MODES = {
+    "idle",
+    "ready",
+    "observing",
+    "acting",
+    "approval",
+    "paused",
+    "stopped",
+    "error",
+}
+
+
+class AIUIError(RuntimeError):
+    def __init__(self, message: str, *, code: int = 1, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def load_policy() -> dict[str, Any]:
+    try:
+        data = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AIUIError(f"failed to load policy: {exc}", code=2) from exc
+    if data.get("version") != 2:
+        raise AIUIError("unsupported policy version", code=2, details={"path": str(POLICY_PATH)})
+    return data
+
+
+def xdg_runtime_dir() -> Path:
+    raw = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    base = Path(raw)
+    if not base.is_dir():
+        base = Path(tempfile.gettempdir()) / f"aiui-{os.getuid()}"
+    target = base / "aiui"
+    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        target.chmod(0o700)
+    return target
+
+
+def xdg_state_dir() -> Path:
+    base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    target = base / "aiui"
+    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        target.chmod(0o700)
+    return target
+
+
+def state_path() -> Path:
+    return xdg_runtime_dir() / "state.json"
+
+
+def state_lock_path() -> Path:
+    return xdg_runtime_dir() / "state.lock"
+
+
+def audit_path() -> Path:
+    return xdg_state_dir() / "audit.jsonl"
+
+
+def default_state() -> dict[str, Any]:
+    return {
+        "version": 2,
+        "mode": "idle",
+        "session_id": None,
+        "task": "",
+        "last_action": "",
+        "last_error": "",
+        "risk": "low",
+        "pending": None,
+        "source": "",
+        "updated_at": now_iso(),
+    }
+
+
+def _read_state_unlocked() -> dict[str, Any]:
+    path = state_path()
+    if not path.exists():
+        return default_state()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default_state() | {"mode": "error", "last_error": "state file was unreadable"}
+    if not isinstance(value, dict) or value.get("mode") not in VALID_MODES:
+        return default_state() | {"mode": "error", "last_error": "state file had an invalid schema"}
+    return default_state() | value
+
+
+def _atomic_json_write(path: Path, value: dict[str, Any], mode: int = 0o600) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        with contextlib.suppress(OSError):
+            path.chmod(mode)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+def read_state() -> dict[str, Any]:
+    lock = state_lock_path()
+    with lock.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        return _read_state_unlocked()
+
+
+def update_state(*, signal_waybar: bool = True, **changes: Any) -> dict[str, Any]:
+    lock = state_lock_path()
+    with lock.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        current = _read_state_unlocked()
+        current.update(changes)
+        current["updated_at"] = now_iso()
+        _atomic_json_write(state_path(), current)
+    if signal_waybar:
+        refresh_waybar()
+    return current
+
+
+def refresh_waybar() -> None:
+    try:
+        signum = int(load_policy().get("waybar_signal", 10))
+    except (AIUIError, TypeError, ValueError):
+        signum = 10
+    if signum < 1 or signum > 31:
+        signum = 10
+    pkill = shutil.which("pkill")
+    if pkill:
+        subprocess.run(
+            [pkill, f"-RTMIN+{signum}", "waybar"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
+def redact_text(value: str, limit: int = 500) -> str:
+    result = value
+    patterns = [
+        r"(?i)(password|passphrase|token|secret|api[_-]?key)(\s*[:=]\s*)(\S+)",
+        r"(?i)(authorization:\s*bearer\s+)(\S+)",
+    ]
+    for pattern in patterns:
+        result = re.sub(pattern, r"\1\2<redacted>", result)
+    if len(result) > limit:
+        result = result[:limit] + "…"
+    return result
+
+
+def log_event(kind: str, **fields: Any) -> None:
+    event = {"ts": now_iso(), "kind": kind, "pid": os.getpid()}
+    for key, value in fields.items():
+        if isinstance(value, str):
+            event[key] = redact_text(value)
+        elif isinstance(value, list):
+            event[key] = [redact_text(str(item)) for item in value]
+        else:
+            event[key] = value
+    path = audit_path()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def emit(value: dict[str, Any], *, code: int = 0, compact: bool = False) -> None:
+    if compact:
+        print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print(json.dumps(value, ensure_ascii=False, indent=2))
+    raise SystemExit(code)
+
+
+def is_socket(path: str | Path) -> bool:
+    try:
+        return stat.S_ISSOCK(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+def discover_session_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    target = env if env is not None else os.environ
+    runtime = target.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    target.setdefault("XDG_RUNTIME_DIR", runtime)
+
+    if not target.get("WAYLAND_DISPLAY"):
+        for candidate in sorted(glob.glob(f"{runtime}/wayland-*")):
+            if is_socket(candidate):
+                target["WAYLAND_DISPLAY"] = Path(candidate).name
+                break
+
+    if not target.get("NIRI_SOCKET"):
+        candidates: list[str] = []
+        for pattern in (
+            f"{runtime}/niri*.sock",
+            f"{runtime}/niri*socket*",
+            f"{runtime}/niri*/socket",
+        ):
+            candidates.extend(glob.glob(pattern))
+        for candidate in sorted(set(candidates)):
+            if is_socket(candidate):
+                target["NIRI_SOCKET"] = candidate
+                break
+
+    if not target.get("DBUS_SESSION_BUS_ADDRESS") and is_socket(f"{runtime}/bus"):
+        target["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={runtime}/bus"
+
+    if not target.get("YDOTOOL_SOCKET") and is_socket("/run/ydotoold/socket"):
+        target["YDOTOOL_SOCKET"] = "/run/ydotoold/socket"
+
+    return target
+
+
+def run_external(
+    argv: Sequence[str],
+    *,
+    input_text: str | None = None,
+    timeout: float = 30,
+    capture: bool = True,
+    check: bool = False,
+    cwd: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = discover_session_env(os.environ.copy())
+    kwargs: dict[str, Any] = {
+        "args": list(argv),
+        "text": True,
+        "input": input_text,
+        "timeout": timeout,
+        "check": check,
+        "env": env,
+        "cwd": cwd,
+    }
+    if capture:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    else:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+    return subprocess.run(**kwargs)
+
+
+def notify(summary: str, body: str = "", *, urgency: str = "normal") -> None:
+    if not shutil.which("notify-send"):
+        return
+    try:
+        env = discover_session_env(os.environ.copy())
+        subprocess.Popen(
+            [
+                "notify-send",
+                "--app-name",
+                "AIUI",
+                "--urgency",
+                urgency,
+                summary,
+                body,
+            ],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def niri_json(*args: str, timeout: float = 10) -> Any:
+    if not shutil.which("niri"):
+        raise AIUIError("niri is not in PATH", code=20)
+    cp = run_external(["niri", "msg", "--json", *args], timeout=timeout)
+    if cp.returncode != 0:
+        raise AIUIError(
+            cp.stderr.strip() or cp.stdout.strip() or "niri IPC failed",
+            code=20,
+            details={"argv": ["niri", "msg", "--json", *args]},
+        )
+    try:
+        return json.loads(cp.stdout)
+    except json.JSONDecodeError as exc:
+        raise AIUIError("niri returned invalid JSON", code=20, details={"stdout": cp.stdout[-1000:]}) from exc
+
+
+def unwrap_niri(value: Any) -> Any:
+    if isinstance(value, dict) and "Ok" in value:
+        ok = value["Ok"]
+        if isinstance(ok, dict) and len(ok) == 1:
+            return next(iter(ok.values()))
+        return ok
+    return value
+
+
+def focused_window() -> dict[str, Any] | None:
+    try:
+        value = unwrap_niri(niri_json("focused-window"))
+    except AIUIError:
+        return None
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        if "FocusedWindow" in value and isinstance(value["FocusedWindow"], dict):
+            return value["FocusedWindow"]
+        return value
+    return None
+
+
+def regex_matches(patterns: Iterable[str], text: str) -> str | None:
+    for pattern in patterns:
+        try:
+            if re.search(pattern, text):
+                return pattern
+        except re.error:
+            continue
+    return None
+
+
+def sensitive_window_reason(window: dict[str, Any] | None, policy: dict[str, Any]) -> str | None:
+    if not window:
+        return None
+    app_id = str(window.get("app_id") or "")
+    title = str(window.get("title") or "")
+    match = regex_matches(policy.get("sensitive_app_patterns", []), app_id)
+    if match:
+        return f"focused app_id matches sensitive policy: {app_id}"
+    match = regex_matches(policy.get("sensitive_title_patterns", []), title)
+    if match:
+        return f"focused title matches sensitive policy: {redact_text(title, 120)}"
+    return None
+
+
+def focused_is_terminal(window: dict[str, Any] | None, policy: dict[str, Any]) -> bool:
+    if not window:
+        return False
+    app_id = str(window.get("app_id") or "")
+    return regex_matches(policy.get("terminal_app_patterns", []), app_id) is not None
+
+
+def risk_max(*risks: str) -> str:
+    return max(risks, key=lambda value: RISK_ORDER.get(value, -1))
+
+
+def infer_content_risk(reason: str, detail: str, policy: dict[str, Any]) -> tuple[str, str]:
+    combined = f"{reason}\n{detail}"
+    deny = regex_matches(policy.get("deny_content_patterns", []), combined)
+    if deny:
+        return "deny", f"matches protected-content pattern: {deny}"
+    high = regex_matches(policy.get("high_risk_action_patterns", []), combined)
+    if high:
+        return "high", f"matches high-risk action pattern: {high}"
+    return "low", "no keyword escalation"
+
+
+def expanded_blocked_paths(policy: dict[str, Any]) -> list[Path]:
+    values: list[Path] = []
+    for raw in policy.get("blocked_paths", []):
+        values.append(Path(os.path.expandvars(os.path.expanduser(str(raw)))).resolve(strict=False))
+    return values
+
+
+def argv_mentions_blocked_path(
+    argv: Sequence[str], policy: dict[str, Any], *, cwd: str | None = None
+) -> str | None:
+    blocked = expanded_blocked_paths(policy)
+    base = Path(cwd or os.getcwd()).expanduser().resolve(strict=False)
+    for item in argv:
+        if not item or item.startswith("-"):
+            continue
+        candidate = Path(os.path.expandvars(os.path.expanduser(item)))
+        if not candidate.is_absolute():
+            candidate = base / candidate
+        resolved = candidate.resolve(strict=False)
+        for root in blocked:
+            try:
+                resolved.relative_to(root)
+                return str(root)
+            except ValueError:
+                continue
+    return None
+
+
+def classify_command(
+    argv: Sequence[str], policy: dict[str, Any], *, cwd: str | None = None
+) -> tuple[str, str]:
+    if not argv:
+        return "deny", "empty command"
+    command = Path(argv[0]).name
+    lower = [item.lower() for item in argv]
+
+    blocked = argv_mentions_blocked_path(argv, policy, cwd=cwd)
+    if blocked:
+        return "deny", f"mentions protected path: {blocked}"
+
+    if command in set(policy.get("deny_commands", [])):
+        return "deny", f"command is denied: {command}"
+
+    if command in {"bash", "sh", "zsh", "fish", "dash"} and any(flag in lower[1:] for flag in ("-c", "--command")):
+        return "deny", "shell command strings are not allowed through the structured runner"
+
+    if command == "git":
+        sub = lower[1] if len(lower) > 1 else ""
+        if sub in {"status", "diff", "log", "show", "rev-parse"}:
+            return "low", f"read-only git subcommand: {sub}"
+        if sub in {"push", "clean", "reset", "commit", "merge", "rebase", "checkout", "switch", "restore", "add"}:
+            return "high", f"state-changing git subcommand: {sub}"
+        return "high", "unclassified git subcommand"
+
+    if command == "niri":
+        if len(lower) >= 3 and lower[1] == "msg" and lower[2] in {"--json", "-j"}:
+            return "low", "read-only niri JSON query"
+        return "high", "direct niri action; use the dedicated niri-action command"
+
+    if command == "nix":
+        joined = " ".join(lower[1:])
+        if any(token in joined for token in ("flake update", "profile remove", "store delete", "collect-garbage")):
+            return "high", "state-changing nix operation"
+        if lower[1:2] in (["eval"], ["path-info"], ["show-derivation"], ["flake"]):
+            return "medium", "nix command may evaluate or fetch inputs"
+        return "high", "unclassified nix operation"
+
+    if command == "sed" and any(item == "-i" or item.startswith("-i") for item in argv[1:]):
+        return "high", "sed in-place edit"
+    if command == "find" and any(item in {"-delete", "-exec", "-execdir", "-ok", "-okdir"} for item in lower[1:]):
+        return "high", "state-changing find expression"
+
+    if command in set(policy.get("readonly_commands", [])):
+        return "low", f"read-only command allowlist: {command}"
+    if command in set(policy.get("high_risk_commands", [])):
+        return "high", f"command requires approval: {command}"
+    return "high", "command is not classified as read-only"
+
+
+def operational_state(*, require_session: bool = True) -> dict[str, Any]:
+    state = read_state()
+    mode = state.get("mode")
+    if mode == "stopped":
+        raise AIUIError(
+            "AI desktop control is emergency-stopped; only the user may reset it from the Waybar/launcher menu",
+            code=40,
+        )
+    if mode == "paused":
+        raise AIUIError("AI desktop control is paused", code=41)
+    if mode == "approval":
+        raise AIUIError("another action is waiting for approval", code=42)
+    if require_session and not state.get("session_id"):
+        raise AIUIError("no active AIUI session; run `aiui session start --task ...` first", code=43)
+    return state
+
+
+def restore_ready_after_action() -> None:
+    state = read_state()
+    if state.get("mode") in {"stopped", "paused"}:
+        return
+    update_state(mode="ready" if state.get("session_id") else "idle", pending=None)
+
+
+def action_fingerprint(kind: str, detail: str) -> str:
+    return hashlib.sha256(f"{kind}\0{detail}".encode("utf-8")).hexdigest()[:12]
+
+
+def fuzzel_select(options: Sequence[str], *, prompt: str, width: int = 72, timeout: float = 600) -> str:
+    if not shutil.which("fuzzel") or not os.environ.get("WAYLAND_DISPLAY"):
+        return ""
+    cp = run_external(
+        [
+            "fuzzel",
+            "--dmenu",
+            "--prompt",
+            prompt,
+            "--cache",
+            "/dev/null",
+            "--width",
+            str(width),
+            "--lines",
+            str(max(3, len(options))),
+        ],
+        input_text="\n".join(options) + "\n",
+        timeout=timeout,
+    )
+    if cp.returncode != 0:
+        return ""
+    return cp.stdout.strip()
+
+
+def terminal_confirmation(prompt: str) -> str:
+    if not sys.stdin.isatty():
+        return ""
+    print(prompt, file=sys.stderr)
+    print("Type APPROVE to approve once, PAUSE to pause, or anything else to deny:", file=sys.stderr)
+    return sys.stdin.readline().strip().upper()
+
+
+def request_approval(*, kind: str, risk: str, reason: str, detail: str) -> None:
+    policy = load_policy()
+    mode = str(policy.get("approval_mode", "balanced"))
+    require = risk == "high" or (risk == "medium" and mode == "strict")
+    if risk == "deny":
+        log_event("blocked", action=kind, risk=risk, reason=reason, detail=detail)
+        if policy.get("notifications", {}).get("blocked", True):
+            notify("AI action blocked", redact_text(reason, 160), urgency="critical")
+        raise AIUIError("policy denied this action", code=50, details={"reason": reason, "detail": detail})
+    if not require:
+        return
+
+    state = operational_state(require_session=True)
+    fingerprint = action_fingerprint(kind, detail)
+    pending = {
+        "fingerprint": fingerprint,
+        "kind": kind,
+        "risk": risk,
+        "reason": redact_text(reason, 240),
+        "detail": redact_text(detail, 500),
+    }
+    update_state(mode="approval", risk=risk, last_action=kind, pending=pending)
+    log_event("approval_requested", fingerprint=fingerprint, action=kind, risk=risk, reason=reason, detail=detail)
+
+    summary = f"AI approval required [{fingerprint}]"
+    body = f"{reason}\n{detail}"
+    if policy.get("notifications", {}).get("approval", True):
+        notify(summary, redact_text(body, 350), urgency="critical")
+
+    options = [
+        f"Approve once [{fingerprint}]",
+        "Deny",
+        "Pause automation",
+        "Emergency stop",
+    ]
+    prompt_text = f"AI {risk.upper()} · {redact_text(reason, 58)}: "
+    try:
+        selection = fuzzel_select(options, prompt=prompt_text, width=96)
+    except subprocess.TimeoutExpired as exc:
+        update_state(mode="ready", pending=None)
+        log_event("approval_result", fingerprint=fingerprint, approved=False, result="timeout")
+        raise AIUIError("approval timed out", code=52) from exc
+    if not selection:
+        fallback = terminal_confirmation(f"{summary}\n{body}")
+        if fallback == "APPROVE":
+            selection = options[0]
+        elif fallback == "PAUSE":
+            selection = "Pause automation"
+        else:
+            selection = "Deny"
+
+    if selection == options[0]:
+        current = read_state()
+        if current.get("mode") == "stopped":
+            raise AIUIError("emergency stop was activated while approval was open", code=40)
+        if current.get("mode") == "paused":
+            raise AIUIError("automation was paused while approval was open", code=41)
+        if current.get("session_id") != state.get("session_id"):
+            update_state(mode="idle", pending=None)
+            raise AIUIError("AIUI session changed while approval was open", code=51)
+        update_state(mode="ready", pending=None)
+        log_event("approval_result", fingerprint=fingerprint, approved=True)
+        return
+
+    if selection == "Pause automation":
+        update_state(mode="paused", pending=None, source="approval")
+        log_event("approval_result", fingerprint=fingerprint, approved=False, result="paused")
+        raise AIUIError("user paused automation", code=41)
+
+    if selection == "Emergency stop":
+        emergency_stop(source="approval")
+        log_event("approval_result", fingerprint=fingerprint, approved=False, result="stopped")
+        raise AIUIError("user emergency-stopped automation", code=40)
+
+    update_state(mode="ready", pending=None)
+    log_event("approval_result", fingerprint=fingerprint, approved=False, result="denied")
+    raise AIUIError("user denied the action", code=52)
+
+
+def prepare_action(
+    *,
+    kind: str,
+    requested_risk: str,
+    reason: str,
+    detail: str,
+    allow_sensitive: bool = False,
+) -> tuple[str, dict[str, Any] | None]:
+    operational_state(require_session=True)
+    policy = load_policy()
+    window = focused_window()
+    sensitive = sensitive_window_reason(window, policy)
+    if sensitive and not allow_sensitive:
+        log_event("blocked_sensitive_window", action=kind, reason=reason, detail=sensitive)
+        if policy.get("notifications", {}).get("blocked", True):
+            notify("AI desktop control blocked", sensitive, urgency="critical")
+        raise AIUIError("focused window is protected by sensitive-window policy", code=53, details={"why": sensitive})
+
+    inferred, why = infer_content_risk(reason, detail, policy)
+    risk = risk_max(requested_risk, inferred)
+    request_approval(kind=kind, risk=risk, reason=reason, detail=f"{detail}\nClassifier: {why}")
+    operational_state(require_session=True)
+    update_state(mode="acting", last_action=kind, risk=risk, last_error="", pending=None)
+    return risk, window
+
+
+def delete_all_screenshots() -> None:
+    for path in xdg_runtime_dir().glob("screen-*.png"):
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
+def cleanup_screenshots(policy: dict[str, Any]) -> None:
+    cfg = policy.get("screenshot", {})
+    max_files = max(1, int(cfg.get("max_files", 8)))
+    max_age = max(60, int(cfg.get("max_age_seconds", 900)))
+    paths = sorted(xdg_runtime_dir().glob("screen-*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+    cutoff = time.time() - max_age
+    for index, path in enumerate(paths):
+        try:
+            if index >= max_files or path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def emergency_stop(*, source: str) -> dict[str, Any]:
+    state = update_state(
+        mode="stopped",
+        pending=None,
+        source=source,
+        last_action="emergency-stop",
+        risk="high",
+    )
+    log_event("emergency_stop", source=source, session_id=state.get("session_id"), task=state.get("task", ""))
+    notify("AI desktop automation stopped", f"Source: {source}", urgency="critical")
+    return state
+
+
+def cmd_doctor(_: argparse.Namespace) -> None:
+    discover_session_env()
+    commands = ["niri", "grim", "wtype", "ydotool", "fuzzel", "notify-send", "footclient", "pkill"]
+    found = {name: shutil.which(name) for name in commands}
+    niri_ok = False
+    niri_error = ""
+    try:
+        niri_json("version")
+        niri_ok = True
+    except AIUIError as exc:
+        niri_error = str(exc)
+    ydotool_socket = os.environ.get("YDOTOOL_SOCKET", "/run/ydotoold/socket")
+    result = {
+        "ok": niri_ok and bool(found["grim"]) and bool(found["wtype"]) and bool(found["ydotool"]),
+        "version": VERSION,
+        "policy": str(POLICY_PATH),
+        "commands": found,
+        "environment": {
+            key: os.environ.get(key)
+            for key in ("XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "NIRI_SOCKET", "YDOTOOL_SOCKET", "DBUS_SESSION_BUS_ADDRESS")
+        },
+        "niri_ok": niri_ok,
+        "niri_error": niri_error,
+        "ydotool_socket": ydotool_socket,
+        "ydotool_socket_exists": is_socket(ydotool_socket),
+        "state": read_state(),
+        "audit_log": str(audit_path()),
+    }
+    emit(result, code=0 if result["ok"] else 1)
+
+
+def cmd_session_start(args: argparse.Namespace) -> None:
+    state = read_state()
+    if state.get("mode") == "stopped":
+        raise AIUIError("cannot start while emergency-stopped; reset from the Waybar/launcher menu", code=40)
+    if state.get("mode") == "paused":
+        raise AIUIError("cannot start while paused", code=41)
+    if state.get("session_id") and not args.replace:
+        raise AIUIError("an AIUI session is already active; end it or pass --replace", code=44)
+    session_id = f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+    updated = update_state(
+        mode="ready",
+        session_id=session_id,
+        task=args.task,
+        last_action="session-start",
+        last_error="",
+        risk="low",
+        pending=None,
+        source=args.source,
+    )
+    log_event("session_start", session_id=session_id, task=args.task, source=args.source, replaced=bool(state.get("session_id")))
+    if load_policy().get("notifications", {}).get("session", True):
+        notify("AI desktop automation started", redact_text(args.task, 200))
+    emit({"ok": True, "state": updated})
+
+
+def cmd_session_end(args: argparse.Namespace) -> None:
+    state = read_state()
+    if state.get("mode") == "stopped":
+        # Preserve the stop latch even though the logical task has ended.
+        updated = update_state(session_id=None, task="", pending=None, last_action="session-end")
+    else:
+        updated = update_state(
+            mode="idle",
+            session_id=None,
+            task="",
+            pending=None,
+            last_action="session-end",
+            risk="low",
+            source=args.source,
+        )
+    policy = load_policy()
+    if policy.get("screenshot", {}).get("delete_on_session_end", True):
+        delete_all_screenshots()
+    log_event("session_end", previous_session_id=state.get("session_id"), result=args.result, source=args.source)
+    if policy.get("notifications", {}).get("session", True):
+        notify("AI desktop automation finished", redact_text(args.result, 200))
+    emit({"ok": True, "state": updated})
+
+
+def cmd_status(_: argparse.Namespace) -> None:
+    emit({"ok": True, "state": read_state(), "audit_log": str(audit_path())})
+
+
+def waybar_payload(state: dict[str, Any]) -> dict[str, Any]:
+    mode = str(state.get("mode", "error"))
+    text_map = {
+        "idle": "AI",
+        "ready": "AI·",
+        "observing": "AI◌",
+        "acting": "AI▶",
+        "approval": "AI?",
+        "paused": "AIⅡ",
+        "stopped": "AI■",
+        "error": "AI!",
+    }
+    lines = [
+        "AI desktop automation",
+        f"State: {mode}",
+    ]
+    if state.get("session_id"):
+        lines.append(f"Session: {state['session_id']}")
+    if state.get("task"):
+        lines.append(f"Task: {state['task']}")
+    if state.get("last_action"):
+        lines.append(f"Last action: {state['last_action']}")
+    if state.get("risk"):
+        lines.append(f"Risk: {state['risk']}")
+    pending = state.get("pending")
+    if isinstance(pending, dict):
+        lines.append(f"Pending: {pending.get('kind', '')} [{pending.get('fingerprint', '')}]")
+        lines.append(str(pending.get("reason", "")))
+    if state.get("last_error"):
+        lines.append(f"Error: {state['last_error']}")
+    lines.extend(
+        [
+            f"Updated: {state.get('updated_at', '')}",
+            "Left: controls · Middle: pause/resume · Right: emergency stop",
+        ]
+    )
+    return {
+        "text": text_map.get(mode, "AI!"),
+        "tooltip": "\n".join(lines),
+        "class": mode,
+        "alt": mode,
+    }
+
+
+def cmd_waybar(_: argparse.Namespace) -> None:
+    emit(waybar_payload(read_state()), compact=True)
+
+
+def cmd_pause(args: argparse.Namespace) -> None:
+    state = read_state()
+    if state.get("mode") == "stopped":
+        raise AIUIError("automation is emergency-stopped", code=40)
+    updated = update_state(mode="paused", source=args.source, pending=None, last_action="pause")
+    log_event("pause", source=args.source)
+    notify("AI desktop automation paused", f"Source: {args.source}")
+    emit({"ok": True, "state": updated})
+
+
+def cmd_resume(args: argparse.Namespace) -> None:
+    state = read_state()
+    if state.get("mode") == "stopped":
+        raise AIUIError("automation is emergency-stopped; reset it from the control menu", code=40)
+    updated = update_state(
+        mode="ready" if state.get("session_id") else "idle",
+        source=args.source,
+        pending=None,
+        last_action="resume",
+    )
+    log_event("resume", source=args.source)
+    notify("AI desktop automation resumed", f"Source: {args.source}")
+    emit({"ok": True, "state": updated})
+
+
+def cmd_toggle_pause(args: argparse.Namespace) -> None:
+    if read_state().get("mode") == "paused":
+        cmd_resume(args)
+    cmd_pause(args)
+
+
+def cmd_emergency_stop(args: argparse.Namespace) -> None:
+    emit({"ok": True, "state": emergency_stop(source=args.source)})
+
+
+def interactive_reset(source: str) -> dict[str, Any]:
+    state = read_state()
+    if state.get("mode") != "stopped":
+        return state
+    choice = fuzzel_select(
+        ["Keep stopped", "Re-enable AI desktop controls"],
+        prompt="Reset AI emergency stop: ",
+        width=72,
+    )
+    if not choice and sys.stdin.isatty():
+        print("Type RESET to re-enable AI desktop controls:", file=sys.stderr)
+        choice = "Re-enable AI desktop controls" if sys.stdin.readline().strip() == "RESET" else "Keep stopped"
+    if choice != "Re-enable AI desktop controls":
+        raise AIUIError("emergency stop remains active", code=40)
+    updated = update_state(
+        mode="idle",
+        session_id=None,
+        task="",
+        pending=None,
+        source=source,
+        last_action="reset-stop",
+        last_error="",
+        risk="low",
+    )
+    log_event("reset_stop", source=source)
+    notify("AI desktop controls re-enabled", "No automation session is active.")
+    return updated
+
+
+def cmd_reset(args: argparse.Namespace) -> None:
+    emit({"ok": True, "state": interactive_reset(args.source)})
+
+
+def open_audit_log() -> None:
+    path = audit_path()
+    path.touch(mode=0o600, exist_ok=True)
+    command = f"tail -n 200 {shlex.quote(str(path))}; printf '\\nPress Enter to close...'; read -r _"
+    env = discover_session_env(os.environ.copy())
+    if shutil.which("footclient"):
+        argv = ["footclient", "--app-id", "aiui-audit", "--title", "AIUI audit log", "sh", "-lc", command]
+    elif shutil.which("foot"):
+        argv = ["foot", "--app-id", "aiui-audit", "--title", "AIUI audit log", "sh", "-lc", command]
+    else:
+        notify("AIUI audit log", str(path))
+        return
+    subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def cmd_menu(args: argparse.Namespace) -> None:
+    discover_session_env()
+    state = read_state()
+    options: list[str] = []
+    if state.get("mode") == "stopped":
+        options.append("Reset emergency stop")
+    elif state.get("mode") == "paused":
+        options.append("Resume automation")
+    else:
+        options.append("Pause automation")
+    options.extend(["Emergency stop", "Show current status", "Open audit log", "Cancel"])
+    choice = fuzzel_select(options, prompt="AI desktop controls: ", width=74)
+
+    if choice == "Reset emergency stop":
+        result = interactive_reset(args.source)
+    elif choice == "Resume automation":
+        state = update_state(mode="ready" if state.get("session_id") else "idle", source=args.source, last_action="resume")
+        log_event("resume", source=args.source)
+        result = state
+    elif choice == "Pause automation":
+        state = update_state(mode="paused", source=args.source, last_action="pause", pending=None)
+        log_event("pause", source=args.source)
+        result = state
+    elif choice == "Emergency stop":
+        result = emergency_stop(source=args.source)
+    elif choice == "Show current status":
+        payload = waybar_payload(read_state())
+        notify("AI desktop automation", payload["tooltip"])
+        result = read_state()
+    elif choice == "Open audit log":
+        open_audit_log()
+        result = read_state()
+    else:
+        result = read_state()
+    emit({"ok": True, "choice": choice or "cancel", "state": result})
+
+
+def cmd_observe(args: argparse.Namespace) -> None:
+    operational_state(require_session=True)
+    policy = load_policy()
+    window = focused_window()
+    sensitive = sensitive_window_reason(window, policy)
+    if sensitive and not args.force_sensitive:
+        log_event("observe_blocked", why=sensitive)
+        update_state(last_action="observe-blocked", risk="deny")
+        if policy.get("notifications", {}).get("blocked", True):
+            notify("AI screenshot blocked", sensitive, urgency="critical")
+        raise AIUIError("focused window is protected; screenshot was not taken", code=53, details={"why": sensitive})
+    if sensitive and args.force_sensitive:
+        request_approval(
+            kind="observe-sensitive-window",
+            risk="high",
+            reason="capture a window protected by the sensitive-window policy",
+            detail=sensitive,
+        )
+
+    update_state(mode="observing", last_action="observe", risk="high" if sensitive else "low", last_error="")
+    cleanup_screenshots(policy)
+    screenshot: Path | None = None
+    try:
+        if not args.no_screenshot:
+            if not shutil.which("grim"):
+                raise AIUIError("grim is not in PATH", code=21)
+            stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            screenshot = xdg_runtime_dir() / f"screen-{stamp}-{secrets.token_hex(2)}.png"
+            argv = ["grim"]
+            if args.output:
+                argv.extend(["-o", args.output])
+            argv.append(str(screenshot))
+            cp = run_external(argv, timeout=30)
+            if cp.returncode != 0 or not screenshot.is_file() or screenshot.stat().st_size == 0:
+                raise AIUIError("grim screenshot failed", code=21, details={"stderr": cp.stderr.strip()})
+            with contextlib.suppress(OSError):
+                screenshot.chmod(0o600)
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "screenshot": str(screenshot) if screenshot else None,
+            "captured_at": now_iso(),
+        }
+        for key, query in {
+            "focused_window": ("focused-window",),
+            "windows": ("windows",),
+            "workspaces": ("workspaces",),
+            "outputs": ("outputs",),
+        }.items():
+            try:
+                result[key] = unwrap_niri(niri_json(*query))
+            except AIUIError as exc:
+                result[key] = {"error": str(exc)}
+        log_event(
+            "observe",
+            screenshot=str(screenshot) if screenshot else "",
+            focused_app=str((window or {}).get("app_id") or ""),
+            focused_title_sha256=hashlib.sha256(str((window or {}).get("title") or "").encode("utf-8")).hexdigest(),
+        )
+        emit(result)
+    finally:
+        restore_ready_after_action()
+
+
+def cmd_type(args: argparse.Namespace) -> None:
+    text = sys.stdin.read() if args.stdin else (args.text or "")
+    if not text:
+        raise AIUIError("text input is empty", code=22)
+    policy = load_policy()
+    window = focused_window()
+    base_risk = args.risk or "medium"
+    protected_content = regex_matches(policy.get("deny_content_patterns", []), text)
+    if protected_content:
+        base_risk = "deny"
+    detail = f"type {len(text)} characters into the focused window"
+    if protected_content:
+        detail += f"; text matches protected-content policy: {protected_content}"
+    if len(text) > 500:
+        base_risk = risk_max(base_risk, "high")
+    if focused_is_terminal(window, policy) and ("\n" in text or "\r" in text):
+        command_line = text.strip().splitlines()[0] if text.strip() else ""
+        if command_line:
+            try:
+                command_argv = shlex.split(command_line)
+            except ValueError:
+                command_argv = [command_line]
+            command_risk, why = classify_command(command_argv, policy)
+            base_risk = risk_max(base_risk, command_risk)
+            detail += f"; focused app appears to be a terminal; command classifier: {why}"
+    risk, _ = prepare_action(
+        kind="type",
+        requested_risk=base_risk,
+        reason=args.reason or "type text into the focused application",
+        detail=detail,
+    )
+    try:
+        if not shutil.which("wtype"):
+            raise AIUIError("wtype is not in PATH", code=22)
+        cp = run_external(["wtype", "-d", str(args.delay_ms), "-"], input_text=text, timeout=max(30, len(text) / 20))
+        if cp.returncode != 0:
+            raise AIUIError("wtype failed", code=22, details={"stderr": cp.stderr.strip()})
+        log_event("type", chars=len(text), sha256=hashlib.sha256(text.encode()).hexdigest(), risk=risk, reason=args.reason)
+        emit({"ok": True, "chars": len(text), "risk": risk})
+    finally:
+        restore_ready_after_action()
+
+
+def parse_hotkey(combo: str) -> tuple[list[str], str]:
+    parts = [part.strip().lower() for part in combo.replace(" ", "").split("+") if part.strip()]
+    if not parts:
+        raise AIUIError("hotkey is empty", code=23)
+    aliases = {"super": "logo", "win": "logo", "cmd": "logo", "control": "ctrl"}
+    modifiers: list[str] = []
+    for raw in parts[:-1]:
+        mod = aliases.get(raw, raw)
+        if mod not in {"ctrl", "alt", "shift", "logo"}:
+            raise AIUIError(f"unsupported modifier: {raw}", code=23)
+        if mod not in modifiers:
+            modifiers.append(mod)
+    key_aliases = {
+        "enter": "Return",
+        "return": "Return",
+        "esc": "Escape",
+        "escape": "Escape",
+        "space": "space",
+        "tab": "Tab",
+        "backspace": "BackSpace",
+        "delete": "Delete",
+        "del": "Delete",
+        "up": "Up",
+        "down": "Down",
+        "left": "Left",
+        "right": "Right",
+        "home": "Home",
+        "end": "End",
+        "pageup": "Page_Up",
+        "pagedown": "Page_Down",
+    }
+    key = key_aliases.get(parts[-1], parts[-1])
+    return modifiers, key
+
+
+def cmd_hotkey(args: argparse.Namespace) -> None:
+    modifiers, key = parse_hotkey(args.combo)
+    normalized = "+".join([*modifiers, key])
+    base_risk = args.risk or "medium"
+    if normalized.lower() in {"ctrl+return", "alt+f4", "ctrl+w", "shift+delete", "ctrl+shift+return"}:
+        base_risk = risk_max(base_risk, "high")
+    policy = load_policy()
+    window = focused_window()
+    if key == "Return" and focused_is_terminal(window, policy):
+        base_risk = risk_max(base_risk, "high")
+    risk, _ = prepare_action(
+        kind="hotkey",
+        requested_risk=base_risk,
+        reason=args.reason or f"press {normalized}",
+        detail=f"press and release hotkey {normalized} in the focused window",
+    )
+    try:
+        if not shutil.which("wtype"):
+            raise AIUIError("wtype is not in PATH", code=23)
+        argv = ["wtype"]
+        for modifier in modifiers:
+            argv.extend(["-M", modifier])
+        argv.extend(["-P", key, "-p", key])
+        for modifier in reversed(modifiers):
+            argv.extend(["-m", modifier])
+        cp = run_external(argv, timeout=20)
+        if cp.returncode != 0:
+            raise AIUIError("wtype hotkey failed", code=23, details={"stderr": cp.stderr.strip(), "argv": argv})
+        log_event("hotkey", combo=normalized, risk=risk, reason=args.reason)
+        emit({"ok": True, "combo": normalized, "risk": risk})
+    finally:
+        restore_ready_after_action()
+
+
+def cmd_click(args: argparse.Namespace) -> None:
+    button_codes = {"left": "0xC0", "right": "0xC1", "middle": "0xC2"}
+    detail = f"move the pointer to global coordinates ({args.x}, {args.y}) and {args.button}-click"
+    risk, _ = prepare_action(
+        kind="click",
+        requested_risk=args.risk or "medium",
+        reason=args.reason or "click the specified visible UI target",
+        detail=detail,
+    )
+    try:
+        if not shutil.which("ydotool"):
+            raise AIUIError("ydotool is not in PATH", code=24)
+        move = run_external(
+            ["ydotool", "mousemove", "--absolute", "-x", str(args.x), "-y", str(args.y)],
+            timeout=20,
+        )
+        if move.returncode != 0:
+            raise AIUIError("ydotool mousemove failed", code=24, details={"stderr": move.stderr.strip()})
+        time.sleep(max(0, args.settle_ms) / 1000)
+        click = run_external(["ydotool", "click", button_codes[args.button]], timeout=20)
+        if click.returncode != 0:
+            raise AIUIError("ydotool click failed", code=24, details={"stderr": click.stderr.strip()})
+        log_event("click", x=args.x, y=args.y, button=args.button, risk=risk, reason=args.reason)
+        emit({"ok": True, "x": args.x, "y": args.y, "button": args.button, "risk": risk})
+    finally:
+        restore_ready_after_action()
+
+
+def cmd_niri_action(args: argparse.Namespace) -> None:
+    action_argv: list[str]
+    default_risk = "low"
+    if args.action == "focus-window":
+        if args.id is None:
+            raise AIUIError("focus-window requires --id", code=25)
+        action_argv = ["focus-window", "--id", str(args.id)]
+    elif args.action == "focus-workspace":
+        if args.index is None:
+            raise AIUIError("focus-workspace requires --index", code=25)
+        action_argv = ["focus-workspace", str(args.index)]
+    elif args.action == "toggle-overview":
+        action_argv = ["toggle-overview"]
+    elif args.action == "close-window":
+        action_argv = ["close-window"]
+        default_risk = "high"
+    else:
+        raise AIUIError(f"unsupported niri action: {args.action}", code=25)
+
+    detail = "niri msg action " + " ".join(shlex.quote(item) for item in action_argv)
+    risk, _ = prepare_action(
+        kind=f"niri-action:{args.action}",
+        requested_risk=args.risk or default_risk,
+        reason=args.reason or f"perform Niri action {args.action}",
+        detail=detail,
+        allow_sensitive=args.action in {"focus-window", "focus-workspace", "toggle-overview"},
+    )
+    try:
+        cp = run_external(["niri", "msg", "action", *action_argv], timeout=20)
+        if cp.returncode != 0:
+            raise AIUIError("niri action failed", code=25, details={"stderr": cp.stderr.strip(), "stdout": cp.stdout.strip()})
+        log_event("niri_action", action=args.action, argv=action_argv, risk=risk, reason=args.reason)
+        emit({"ok": True, "action": args.action, "risk": risk, "stdout": cp.stdout.strip()})
+    finally:
+        restore_ready_after_action()
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    argv = list(args.argv)
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        raise AIUIError("run requires a command after `--`", code=26)
+    policy = load_policy()
+    classified, why = classify_command(argv, policy, cwd=args.cwd)
+    requested = args.risk or classified
+    risk = risk_max(requested, classified)
+    detail = f"run structured command: {shlex.join(argv)}\nClassifier: {why}\nWorking directory: {args.cwd or os.getcwd()}"
+    risk, _ = prepare_action(
+        kind="run",
+        requested_risk=risk,
+        reason=args.reason or "run a command-line tool for the current desktop task",
+        detail=detail,
+        allow_sensitive=False,
+    )
+    try:
+        cp = run_external(argv, timeout=args.timeout, cwd=args.cwd)
+        stdout = cp.stdout[-16000:]
+        stderr = cp.stderr[-16000:]
+        log_event(
+            "run",
+            argv=argv,
+            cwd=args.cwd or os.getcwd(),
+            risk=risk,
+            reason=args.reason,
+            classifier=why,
+            returncode=cp.returncode,
+        )
+        emit(
+            {
+                "ok": cp.returncode == 0,
+                "returncode": cp.returncode,
+                "risk": risk,
+                "classifier": why,
+                "stdout": stdout,
+                "stderr": stderr,
+            },
+            code=0 if cp.returncode == 0 else cp.returncode,
+        )
+    finally:
+        restore_ready_after_action()
+
+
+def add_source_argument(parser: argparse.ArgumentParser, default: str = "cli") -> None:
+    parser.add_argument("--source", default=default)
+
+
+def add_risk_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--reason", default="")
+    parser.add_argument("--risk", choices=list(RISK_ORDER))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="aiui", description="Controlled Niri/Wayland computer-use runtime")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    doctor = sub.add_parser("doctor", help="check dependencies and desktop-session integration")
+    doctor.set_defaults(func=cmd_doctor)
+
+    session = sub.add_parser("session", help="manage an automation session")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    start = session_sub.add_parser("start")
+    start.add_argument("--task", required=True)
+    start.add_argument("--replace", action="store_true")
+    add_source_argument(start, "agent")
+    start.set_defaults(func=cmd_session_start)
+    end = session_sub.add_parser("end")
+    end.add_argument("--result", default="completed")
+    add_source_argument(end, "agent")
+    end.set_defaults(func=cmd_session_end)
+
+    status = sub.add_parser("status")
+    status.set_defaults(func=cmd_status)
+
+    waybar = sub.add_parser("waybar", help="emit Waybar custom-module JSON")
+    waybar.set_defaults(func=cmd_waybar)
+
+    menu = sub.add_parser("menu", help="open the fuzzel control menu")
+    add_source_argument(menu, "launcher")
+    menu.set_defaults(func=cmd_menu)
+
+    pause = sub.add_parser("pause")
+    add_source_argument(pause)
+    pause.set_defaults(func=cmd_pause)
+
+    resume = sub.add_parser("resume")
+    add_source_argument(resume)
+    resume.set_defaults(func=cmd_resume)
+
+    toggle = sub.add_parser("toggle-pause")
+    add_source_argument(toggle)
+    toggle.set_defaults(func=cmd_toggle_pause)
+
+    stop = sub.add_parser("emergency-stop")
+    add_source_argument(stop)
+    stop.set_defaults(func=cmd_emergency_stop)
+
+    reset = sub.add_parser("reset-stop", help="interactively re-enable controls after an emergency stop")
+    add_source_argument(reset)
+    reset.set_defaults(func=cmd_reset)
+
+    observe = sub.add_parser("observe", help="capture the screen and Niri state")
+    observe.add_argument("--output", help="capture one Wayland output by name")
+    observe.add_argument("--no-screenshot", action="store_true")
+    observe.add_argument("--force-sensitive", action="store_true", help="override only after explicit user authorization")
+    observe.set_defaults(func=cmd_observe)
+
+    type_cmd = sub.add_parser("type", help="type UTF-8 text with wtype")
+    source = type_cmd.add_mutually_exclusive_group(required=True)
+    source.add_argument("--text")
+    source.add_argument("--stdin", action="store_true")
+    type_cmd.add_argument("--delay-ms", type=int, default=12)
+    add_risk_arguments(type_cmd)
+    type_cmd.set_defaults(func=cmd_type)
+
+    hotkey = sub.add_parser("hotkey", help="press and release a key combination with wtype")
+    hotkey.add_argument("combo")
+    add_risk_arguments(hotkey)
+    hotkey.set_defaults(func=cmd_hotkey)
+
+    click = sub.add_parser("click", help="move and click through ydotool")
+    click.add_argument("--x", type=int, required=True)
+    click.add_argument("--y", type=int, required=True)
+    click.add_argument("--button", choices=["left", "right", "middle"], default="left")
+    click.add_argument("--settle-ms", type=int, default=60)
+    add_risk_arguments(click)
+    click.set_defaults(func=cmd_click)
+
+    niri_action = sub.add_parser("niri-action")
+    niri_action.add_argument("action", choices=["focus-window", "focus-workspace", "toggle-overview", "close-window"])
+    niri_action.add_argument("--id", type=int)
+    niri_action.add_argument("--index", type=int)
+    add_risk_arguments(niri_action)
+    niri_action.set_defaults(func=cmd_niri_action)
+
+    run = sub.add_parser("run", help="run an argv-based command without a shell")
+    run.add_argument("--cwd")
+    run.add_argument("--timeout", type=float, default=60)
+    add_risk_arguments(run)
+    run.add_argument("argv", nargs=argparse.REMAINDER)
+    run.set_defaults(func=cmd_run)
+
+    return parser
+
+
+def main() -> None:
+    discover_session_env()
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except AIUIError as exc:
+        state = read_state()
+        expected_policy_result = exc.code in {40, 41, 42, 43, 50, 51, 52, 53}
+        if not expected_policy_result and state.get("mode") not in {"stopped", "paused", "approval"}:
+            update_state(
+                mode="error" if state.get("session_id") else "idle",
+                last_error=str(exc),
+                last_action=getattr(args, "command", "unknown"),
+                signal_waybar=True,
+            )
+        log_event("error", command=getattr(args, "command", "unknown"), error=str(exc), code=exc.code, details=exc.details)
+        policy: dict[str, Any] = {}
+        with contextlib.suppress(AIUIError):
+            policy = load_policy()
+        if policy.get("notifications", {}).get("error", True) and exc.code not in {40, 41, 42, 43, 52, 53}:
+            notify("AI desktop automation error", redact_text(str(exc), 240), urgency="critical")
+        emit({"ok": False, "error": str(exc), "details": exc.details}, code=exc.code)
+    except subprocess.TimeoutExpired as exc:
+        update_state(mode="error", last_error="operation timed out", last_action=getattr(args, "command", "unknown"))
+        log_event("timeout", command=getattr(args, "command", "unknown"), timeout=exc.timeout)
+        emit({"ok": False, "error": "operation timed out", "timeout": exc.timeout}, code=124)
+    except KeyboardInterrupt:
+        log_event("interrupted", command=getattr(args, "command", "unknown"))
+        emit({"ok": False, "error": "interrupted"}, code=130)
+    except Exception as exc:  # Defensive boundary for the local control script.
+        update_state(mode="error", last_error=str(exc), last_action=getattr(args, "command", "unknown"))
+        log_event("exception", command=getattr(args, "command", "unknown"), error=repr(exc))
+        emit({"ok": False, "error": str(exc)}, code=1)
+
+
+if __name__ == "__main__":
+    main()
