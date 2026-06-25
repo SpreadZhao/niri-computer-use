@@ -9,8 +9,8 @@ KDL, Waybar JSONC, or any live system configuration.
 
 - `packages.<system>.aiui`: the `aiui` runtime wrapped with Python and the
   command-line tools it uses.
-- `homeManagerModules.default`: installs the runtime command, the
-  `niri-computer-use` skill, and the **AI Desktop Controls** launcher entry.
+- `homeManagerModules.default`: generic Home Manager module for non-spreadconfig
+  users.
 - `nixosModules.default`: enables `ydotoold` support and adds the configured
   user to the `ydotool` group.
 
@@ -23,7 +23,7 @@ In `~/workspaces/spreadconfig/flake.nix`, add an input:
 
 ```nix
 niri-computer-use = {
-  url = "github:SpreadZhao/niri-computer-use-spreadconfig-v2";
+  url = "github:SpreadZhao/niri-computer-use";
   inputs.nixpkgs.follows = "nixpkgs";
 };
 ```
@@ -37,50 +37,68 @@ niri-computer-use = {
 };
 ```
 
-Then import the modules in the host construction.
+Then install it using the same one-file-per-feature style as the rest of
+`spreadconfig`.
 
-Add the NixOS module to the `modules = [ ... ]` list passed to
-`nixpkgs.lib.nixosSystem`:
-
-```nix
-inputs.niri-computer-use.nixosModules.default
-```
-
-Add the Home Manager module to `home-manager.users.spreadzhao.imports`:
+Create `modules/home/niri-computer-use.nix`:
 
 ```nix
-inputs.niri-computer-use.homeManagerModules.default
-```
+{ inputs, pkgs, ... }:
 
-Enable the modules:
-
-```nix
+let
+  system = pkgs.stdenv.hostPlatform.system;
+  niriComputerUse = inputs.niri-computer-use.packages.${system}.aiui;
+in
 {
-  services.niri-computer-use = {
-    enable = true;
-    user = "spreadzhao";
-  };
+  home.packages = [ niriComputerUse ];
 
-  home-manager.users.spreadzhao.programs.niri-computer-use = {
-    enable = true;
-    scriptsDir = "/home/spreadzhao/scripts";
-    skillDirectories = [
-      ".agents/skills"
-      ".claude/skills"
-      "workspaces/spreadconfig/.agents/skills"
-      "workspaces/spreadconfig/.claude/skills"
+  xdg.desktopEntries.aiui-control = {
+    name = "AI Desktop Controls";
+    comment = "Pause, stop, inspect, or reset Niri computer-use automation";
+    exec = "${niriComputerUse}/bin/aiui menu --source launcher";
+    icon = "preferences-system";
+    categories = [
+      "System"
+      "Utility"
     ];
+    terminal = false;
+    type = "Application";
   };
 }
 ```
 
-After this rebuild, the runtime command should exist at:
+Create `modules/nixos/niri-computer-use.nix`:
 
-```text
-~/scripts/aiui/aiui
+```nix
+{ ... }:
+
+{
+  programs.ydotool = {
+    enable = true;
+    group = "ydotool";
+  };
+
+  users.users.spreadzhao.extraGroups = [ "ydotool" ];
+}
 ```
 
-The command is also installed as `aiui` in the Home Manager profile.
+Register the skill in `skills/sources.nix` using the existing `skillDirs`
+mechanism:
+
+```nix
+niriComputerUseSkill = {
+  niri-computer-use = {
+    source = "${inputs.niri-computer-use}/overlay/skills/local/niri-computer-use";
+    force = true;
+  };
+};
+```
+
+After this rebuild, the runtime command should exist in the Home Manager profile:
+
+```text
+aiui
+```
 
 ## Manual Niri Configuration
 
@@ -97,8 +115,8 @@ window-rule {
 Add these inside the existing `binds { ... }` block:
 
 ```kdl
-Mod+Escape repeat=false hotkey-overlay-title="AI automation: emergency stop" { spawn-sh "$SCRIPT_HOME/aiui/aiui emergency-stop --source niri"; }
-Mod+Ctrl+Escape repeat=false hotkey-overlay-title="AI automation: pause or resume" { spawn-sh "$SCRIPT_HOME/aiui/aiui toggle-pause --source niri"; }
+Mod+Escape repeat=false hotkey-overlay-title="AI automation: emergency stop" { spawn-sh "aiui emergency-stop --source niri"; }
+Mod+Ctrl+Escape repeat=false hotkey-overlay-title="AI automation: pause or resume" { spawn-sh "aiui toggle-pause --source niri"; }
 ```
 
 These bindings are optional but recommended. They give you a compositor-level
@@ -120,13 +138,13 @@ Add the module definition:
 
 ```jsonc
 "custom/aiui": {
-    "exec": "/home/spreadzhao/scripts/aiui/aiui waybar",
+    "exec": "aiui waybar",
     "return-type": "json",
     "interval": "once",
     "signal": 10,
-    "on-click": "/home/spreadzhao/scripts/aiui/aiui menu --source waybar",
-    "on-click-middle": "/home/spreadzhao/scripts/aiui/aiui toggle-pause --source waybar",
-    "on-click-right": "/home/spreadzhao/scripts/aiui/aiui emergency-stop --source waybar",
+    "on-click": "aiui menu --source waybar",
+    "on-click-middle": "aiui toggle-pause --source waybar",
+    "on-click-right": "aiui emergency-stop --source waybar",
     "tooltip": true
 }
 ```
@@ -201,10 +219,15 @@ systemctl --user restart waybar.service
 ## Validate
 
 ```bash
-AIUI="$HOME/scripts/aiui/aiui"
+AIUI="aiui"
 
 "$AIUI" doctor
 "$AIUI" session start --task 'Validate Niri computer use'
+"$AIUI" observe
+"$AIUI" launch \
+  --reason 'Open WeChat for the current desktop task' \
+  --risk medium \
+  -- wechat
 "$AIUI" observe
 "$AIUI" niri-action toggle-overview \
   --reason 'Validate a harmless Niri action' \
@@ -237,6 +260,8 @@ $XDG_STATE_HOME/aiui/audit.jsonl       persistent redacted audit events
 - High-risk actions require exact, single-use user approval.
 - Typed text is never written to the audit log; only length and SHA-256 are logged.
 - The command runner uses argv arrays, not `shell=True`.
+- GUI application launches use `aiui launch -- ...` so long-running apps do not
+  hold the runtime in `acting`.
 - Privilege escalation and disk-management commands are denied by policy.
 - Unknown CLI programs default to high risk.
 

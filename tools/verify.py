@@ -80,6 +80,7 @@ def main() -> None:
     policy_data = json.loads(policy.read_text(encoding="utf-8"))
     check(policy_data.get("version") == 2, "policy JSON schema version")
     check("sudo" in policy_data.get("deny_commands", []), "policy denies privilege escalation")
+    check("wechat" in policy_data.get("gui_launch_commands", []), "policy allows medium-risk WeChat GUI launch")
 
     skill_text = skill.read_text(encoding="utf-8")
     check(skill_text.startswith("---\nname: niri-computer-use\n"), "skill frontmatter")
@@ -105,6 +106,36 @@ def main() -> None:
         state = json.loads(cp.stdout)["state"]
         check(state.get("mode") == "ready" and state.get("session_id"), "active session state")
 
+        launcher_dir = Path(runtime_raw) / "bin"
+        launcher_dir.mkdir()
+        launcher = launcher_dir / "wechat"
+        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        launch_env = env | {"PATH": f"{launcher_dir}{os.pathsep}{env.get('PATH', '')}"}
+        cp = run(
+            [
+                sys.executable,
+                str(aiui),
+                "launch",
+                "--reason",
+                "Open WeChat for static verification",
+                "--risk",
+                "medium",
+                "--",
+                "wechat",
+            ],
+            env=launch_env,
+        )
+        if cp.returncode != 0:
+            print(cp.stdout, file=sys.stderr)
+            print(cp.stderr, file=sys.stderr)
+        check(cp.returncode == 0, "GUI launch command exits without waiting for app lifetime")
+        payload = json.loads(cp.stdout)
+        check(payload.get("risk") == "medium", "GUI launch keeps allowlisted app at medium risk")
+        cp = run([sys.executable, str(aiui), "status"], env=env)
+        state = json.loads(cp.stdout)["state"]
+        check(state.get("mode") == "ready", "GUI launch restores ready state")
+
         cp = run([sys.executable, str(aiui), "emergency-stop", "--source", "verify"], env=env)
         check(cp.returncode == 0, "emergency-stop command")
         cp = run([sys.executable, str(aiui), "status"], env=env)
@@ -118,6 +149,10 @@ def main() -> None:
     check(risk == "high", "structured runner classifies git push as high risk")
     risk, _ = namespace["classify_command"](["sudo", "true"], policy_data)
     check(risk == "deny", "structured runner denies privilege escalation")
+    risk, _ = namespace["classify_launch_command"](["wechat"], policy_data)
+    check(risk == "medium", "GUI launch classifier allowlists WeChat without arguments")
+    risk, _ = namespace["classify_launch_command"](["wechat", "--some-arg"], policy_data)
+    check(risk == "high", "GUI launch classifier escalates allowlisted app with arguments")
 
     if args.nix:
         check(shutil.which("nix") is not None, "nix executable is available")

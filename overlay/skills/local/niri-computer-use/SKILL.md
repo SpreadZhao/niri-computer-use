@@ -8,7 +8,7 @@ description: Observe and operate SpreadZhao's live Niri/Wayland desktop through 
 Use the repository-managed runtime at:
 
 ```bash
-AIUI="$HOME/scripts/aiui/aiui"
+AIUI="aiui"
 ```
 
 This skill controls the current Niri session. It also drives the `custom/aiui` Waybar module, fnott notifications, and the fuzzel approval/control menus.
@@ -42,7 +42,7 @@ This skill controls the current Niri session. It also drives the `custom/aiui` W
 ## Standard loop
 
 ```bash
-AIUI="$HOME/scripts/aiui/aiui"
+AIUI="aiui"
 
 "$AIUI" doctor
 "$AIUI" session start --task 'Open the requested settings page and inspect it'
@@ -98,6 +98,18 @@ Do not type a terminal command with a trailing newline unless the command has al
 ```
 
 The runtime explicitly presses and releases every modifier.
+
+### Launch a GUI app
+
+Use `launch`, not `run`, for long-running GUI programs. `launch` starts the app
+under the same state, approval, and audit controls, then returns immediately.
+
+```bash
+"$AIUI" launch \
+  --reason 'Open WeChat for the current desktop task' \
+  --risk medium \
+  -- wechat
+```
 
 ### Click a visible target
 
