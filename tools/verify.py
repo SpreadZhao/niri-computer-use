@@ -77,6 +77,10 @@ def main() -> None:
         py_compile.compile(str(aiui), cfile=str(Path(compile_raw) / "aiui.pyc"), doraise=True)
     check(True, "aiui Python syntax")
 
+    expected_version = (PACKAGE_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    namespace = runpy.run_path(str(aiui), run_name="aiui_verify_import")
+    check(namespace.get("VERSION") == expected_version, "aiui script version matches package version")
+
     policy_data = json.loads(policy.read_text(encoding="utf-8"))
     check(policy_data.get("version") == 2, "policy JSON schema version")
     check("sudo" in policy_data.get("deny_commands", []), "policy denies privilege escalation")
@@ -153,7 +157,6 @@ def main() -> None:
         state = json.loads(cp.stdout)["state"]
         check(state.get("mode") == "stopped", "emergency-stop latch state")
 
-    namespace = runpy.run_path(str(aiui), run_name="aiui_verify_import")
     modifiers, key = namespace["parse_hotkey"]("ctrl+shift+enter")
     check(modifiers == ["ctrl", "shift"] and key == "Return", "hotkey parser")
     risk, _ = namespace["classify_command"](["git", "push"], policy_data)
