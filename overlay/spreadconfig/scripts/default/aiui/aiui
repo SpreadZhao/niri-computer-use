@@ -1273,8 +1273,11 @@ def cmd_x11_paste(args: argparse.Namespace) -> None:
             raise AIUIError("xdotool is not in PATH", code=30)
         window_id = resolve_x11_window(args)
         env = discover_session_env(os.environ.copy())
+        # X11 clients often request clipboard metadata before the actual text.
+        # Keep xclip alive briefly after Ctrl+V instead of exiting on the first
+        # selection request.
         copy_proc = subprocess.Popen(
-            ["xclip", "-selection", "clipboard", "-loops", "1", "-quiet", "-i"],
+            ["xclip", "-selection", "clipboard", "-loops", "8", "-quiet", "-i"],
             env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
@@ -1283,7 +1286,7 @@ def cmd_x11_paste(args: argparse.Namespace) -> None:
         )
         try:
             if copy_proc.stdin is None:
-                raise AIUIError("wl-copy stdin is unavailable", code=30)
+                raise AIUIError("xclip stdin is unavailable", code=30)
             copy_proc.stdin.write(text)
             copy_proc.stdin.close()
         except BrokenPipeError as exc:
@@ -1298,12 +1301,12 @@ def cmd_x11_paste(args: argparse.Namespace) -> None:
             copy_proc.terminate()
             raise AIUIError("xdotool paste hotkey failed", code=30, details={"stderr": paste.stderr.strip()})
         try:
-            copy_return = copy_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired as exc:
+            copy_return = copy_proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
             copy_proc.terminate()
             with contextlib.suppress(subprocess.TimeoutExpired):
                 copy_proc.wait(timeout=2)
-            raise AIUIError("xclip did not receive a paste request", code=30) from exc
+            copy_return = 0
         stderr = copy_proc.stderr.read().strip() if copy_proc.stderr else ""
         if copy_return != 0:
             raise AIUIError("xclip failed while serving paste", code=30, details={"stderr": stderr})
