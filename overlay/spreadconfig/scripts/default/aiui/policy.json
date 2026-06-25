@@ -126,6 +126,7 @@
     "rsync"
   ],
   "gui_launch_commands": [
+    "start_wechat.sh",
     "wechat"
   ],
   "readonly_commands": [

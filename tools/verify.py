@@ -81,6 +81,10 @@ def main() -> None:
     check(policy_data.get("version") == 2, "policy JSON schema version")
     check("sudo" in policy_data.get("deny_commands", []), "policy denies privilege escalation")
     check("wechat" in policy_data.get("gui_launch_commands", []), "policy allows medium-risk WeChat GUI launch")
+    check(
+        "start_wechat.sh" in policy_data.get("gui_launch_commands", []),
+        "policy allows medium-risk spreadconfig WeChat launcher",
+    )
 
     skill_text = skill.read_text(encoding="utf-8")
     check(skill_text.startswith("---\nname: niri-computer-use\n"), "skill frontmatter")
@@ -153,6 +157,8 @@ def main() -> None:
     check(risk == "medium", "GUI launch classifier allowlists WeChat without arguments")
     risk, _ = namespace["classify_launch_command"](["wechat", "--some-arg"], policy_data)
     check(risk == "high", "GUI launch classifier escalates allowlisted app with arguments")
+    risk, _ = namespace["classify_launch_command"](["/home/spreadzhao/scripts/util/start_wechat.sh"], policy_data)
+    check(risk == "medium", "GUI launch classifier allowlists spreadconfig WeChat launcher")
 
     if args.nix:
         check(shutil.which("nix") is not None, "nix executable is available")

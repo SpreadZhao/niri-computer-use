@@ -108,7 +108,7 @@ under the same state, approval, and audit controls, then returns immediately.
 "$AIUI" launch \
   --reason 'Open WeChat for the current desktop task' \
   --risk medium \
-  -- wechat
+  -- /home/spreadzhao/scripts/util/start_wechat.sh
 ```
 
 ### Click a visible target

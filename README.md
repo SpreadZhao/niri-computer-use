@@ -227,7 +227,7 @@ AIUI="aiui"
 "$AIUI" launch \
   --reason 'Open WeChat for the current desktop task' \
   --risk medium \
-  -- wechat
+  -- /home/spreadzhao/scripts/util/start_wechat.sh
 "$AIUI" observe
 "$AIUI" niri-action toggle-overview \
   --reason 'Validate a harmless Niri action' \
