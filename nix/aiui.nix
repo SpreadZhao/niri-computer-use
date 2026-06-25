@@ -8,7 +8,7 @@
   wtype,
   ydotool,
   xdotool,
-  wl-clipboard,
+  xclip,
   fuzzel,
   libnotify,
   procps,
@@ -42,7 +42,7 @@ stdenvNoCC.mkDerivation {
           wtype
           ydotool
           xdotool
-          wl-clipboard
+          xclip
           fuzzel
           libnotify
           procps
