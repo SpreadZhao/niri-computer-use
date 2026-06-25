@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 SCRIPT_PATH = Path(__file__).resolve()
 POLICY_PATH = SCRIPT_PATH.with_name("policy.json")
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "deny": 3}
@@ -1272,12 +1272,41 @@ def cmd_x11_paste(args: argparse.Namespace) -> None:
         if not shutil.which("xdotool"):
             raise AIUIError("xdotool is not in PATH", code=30)
         window_id = resolve_x11_window(args)
-        copy = run_external(["wl-copy", "--trim-newline", "--", text], timeout=10)
-        if copy.returncode != 0:
-            raise AIUIError("wl-copy failed", code=30, details={"stderr": copy.stderr.strip()})
+        env = discover_session_env(os.environ.copy())
+        copy_proc = subprocess.Popen(
+            ["wl-copy", "--paste-once", "--foreground", "--trim-newline"],
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            if copy_proc.stdin is None:
+                raise AIUIError("wl-copy stdin is unavailable", code=30)
+            copy_proc.stdin.write(text)
+            copy_proc.stdin.close()
+        except BrokenPipeError as exc:
+            stderr = copy_proc.stderr.read().strip() if copy_proc.stderr else ""
+            raise AIUIError("wl-copy exited before receiving text", code=30, details={"stderr": stderr}) from exc
+        time.sleep(0.2)
+        if copy_proc.poll() not in {None, 0}:
+            stderr = copy_proc.stderr.read().strip() if copy_proc.stderr else ""
+            raise AIUIError("wl-copy failed", code=30, details={"stderr": stderr})
         paste = run_external(["xdotool", "windowactivate", "--sync", window_id, "key", "--window", window_id, "ctrl+v"], timeout=20)
         if paste.returncode != 0:
+            copy_proc.terminate()
             raise AIUIError("xdotool paste hotkey failed", code=30, details={"stderr": paste.stderr.strip()})
+        try:
+            copy_return = copy_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            copy_proc.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                copy_proc.wait(timeout=2)
+            raise AIUIError("wl-copy did not receive a paste request", code=30) from exc
+        stderr = copy_proc.stderr.read().strip() if copy_proc.stderr else ""
+        if copy_return != 0:
+            raise AIUIError("wl-copy failed while serving paste", code=30, details={"stderr": stderr})
         log_event(
             "x11_paste",
             window_id=window_id,
