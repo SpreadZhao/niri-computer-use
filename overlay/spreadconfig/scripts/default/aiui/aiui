@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-VERSION = "2.2.1"
+VERSION = "2.3.0"
 SCRIPT_PATH = Path(__file__).resolve()
 POLICY_PATH = SCRIPT_PATH.with_name("policy.json")
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "deny": 3}
@@ -689,7 +689,7 @@ def emergency_stop(*, source: str) -> dict[str, Any]:
 
 def cmd_doctor(_: argparse.Namespace) -> None:
     discover_session_env()
-    commands = ["niri", "grim", "wtype", "ydotool", "fuzzel", "notify-send", "footclient", "pkill"]
+    commands = ["niri", "grim", "wtype", "ydotool", "xdotool", "fuzzel", "notify-send", "footclient", "pkill"]
     found = {name: shutil.which(name) for name in commands}
     niri_ok = False
     niri_error = ""
@@ -1143,6 +1143,70 @@ def cmd_click(args: argparse.Namespace) -> None:
         restore_ready_after_action()
 
 
+def resolve_x11_window(args: argparse.Namespace) -> str:
+    if args.window_id:
+        return str(args.window_id)
+    cp = run_external(["xdotool", "search", "--name", args.window_name], timeout=10)
+    if cp.returncode != 0:
+        raise AIUIError(
+            "xdotool could not find a matching X11 window",
+            code=28,
+            details={"stderr": cp.stderr.strip(), "window_name": args.window_name},
+        )
+    for line in cp.stdout.splitlines():
+        value = line.strip()
+        if value:
+            return value
+    raise AIUIError("xdotool search returned no window ids", code=28, details={"window_name": args.window_name})
+
+
+def cmd_x11_click(args: argparse.Namespace) -> None:
+    button_codes = {"left": "1", "middle": "2", "right": "3"}
+    target = f"window id {args.window_id}" if args.window_id else f"first X11 window named {args.window_name!r}"
+    detail = (
+        f"activate {target}, move to window-relative coordinates ({args.x}, {args.y}), "
+        f"and {args.button}-click"
+    )
+    risk, _ = prepare_action(
+        kind="x11-click",
+        requested_risk=args.risk or "medium",
+        reason=args.reason or "click the specified visible XWayland UI target",
+        detail=detail,
+    )
+    try:
+        if not shutil.which("xdotool"):
+            raise AIUIError("xdotool is not in PATH", code=28)
+        window_id = resolve_x11_window(args)
+        argv = [
+            "xdotool",
+            "windowactivate",
+            "--sync",
+            window_id,
+            "mousemove",
+            "--window",
+            window_id,
+            str(args.x),
+            str(args.y),
+            "click",
+            button_codes[args.button],
+        ]
+        cp = run_external(argv, timeout=20)
+        if cp.returncode != 0:
+            raise AIUIError("xdotool x11-click failed", code=28, details={"stderr": cp.stderr.strip(), "argv": argv})
+        log_event(
+            "x11_click",
+            window_id=window_id,
+            x=args.x,
+            y=args.y,
+            button=args.button,
+            risk=risk,
+            reason=args.reason,
+        )
+        emit({"ok": True, "window_id": window_id, "x": args.x, "y": args.y, "button": args.button, "risk": risk})
+    finally:
+        restore_ready_after_action()
+
+
 def cmd_niri_action(args: argparse.Namespace) -> None:
     action_argv: list[str]
     default_risk = "low"
@@ -1356,6 +1420,16 @@ def build_parser() -> argparse.ArgumentParser:
     click.add_argument("--settle-ms", type=int, default=60)
     add_risk_arguments(click)
     click.set_defaults(func=cmd_click)
+
+    x11_click = sub.add_parser("x11-click", help="click a target inside an X11/XWayland window")
+    target = x11_click.add_mutually_exclusive_group(required=True)
+    target.add_argument("--window-id")
+    target.add_argument("--window-name")
+    x11_click.add_argument("--x", type=int, required=True, help="window-relative X coordinate")
+    x11_click.add_argument("--y", type=int, required=True, help="window-relative Y coordinate")
+    x11_click.add_argument("--button", choices=["left", "right", "middle"], default="left")
+    add_risk_arguments(x11_click)
+    x11_click.set_defaults(func=cmd_x11_click)
 
     niri_action = sub.add_parser("niri-action")
     niri_action.add_argument("action", choices=["focus-window", "focus-workspace", "toggle-overview", "close-window"])

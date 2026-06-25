@@ -140,6 +140,9 @@ def main() -> None:
         state = json.loads(cp.stdout)["state"]
         check(state.get("mode") == "ready", "GUI launch restores ready state")
 
+        cp = run([sys.executable, str(aiui), "x11-click", "--help"], env=env)
+        check(cp.returncode == 0, "X11 click command help exits successfully")
+
         cp = run([sys.executable, str(aiui), "emergency-stop", "--source", "verify"], env=env)
         check(cp.returncode == 0, "emergency-stop command")
         cp = run([sys.executable, str(aiui), "status"], env=env)

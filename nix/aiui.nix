@@ -7,6 +7,7 @@
   grim,
   wtype,
   ydotool,
+  xdotool,
   fuzzel,
   libnotify,
   procps,
@@ -39,6 +40,7 @@ stdenvNoCC.mkDerivation {
           grim
           wtype
           ydotool
+          xdotool
           fuzzel
           libnotify
           procps

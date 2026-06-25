@@ -121,6 +121,17 @@ under the same state, approval, and audit controls, then returns immediately.
 
 For buttons such as Delete, Send, Submit, Install, Apply, Publish, or Confirm, use `--risk high`. The runtime will show the exact action and a fingerprint in fnott/fuzzel before execution.
 
+### Click an XWayland target
+
+For X11/XWayland windows where the Wayland pointer path does not work, use
+window-relative coordinates through `x11-click`:
+
+```bash
+"$AIUI" x11-click --window-name Weixin --x 140 --y 285 --button left \
+  --reason 'Click the visible Enter Weixin button in the XWayland login window' \
+  --risk medium
+```
+
 ### Close a window
 
 ```bash
