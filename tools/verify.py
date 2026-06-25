@@ -142,6 +142,10 @@ def main() -> None:
 
         cp = run([sys.executable, str(aiui), "x11-click", "--help"], env=env)
         check(cp.returncode == 0, "X11 click command help exits successfully")
+        cp = run([sys.executable, str(aiui), "x11-key", "--help"], env=env)
+        check(cp.returncode == 0, "X11 key command help exits successfully")
+        cp = run([sys.executable, str(aiui), "x11-paste", "--help"], env=env)
+        check(cp.returncode == 0, "X11 paste command help exits successfully")
 
         cp = run([sys.executable, str(aiui), "emergency-stop", "--source", "verify"], env=env)
         check(cp.returncode == 0, "emergency-stop command")

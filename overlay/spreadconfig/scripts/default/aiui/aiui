@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 SCRIPT_PATH = Path(__file__).resolve()
 POLICY_PATH = SCRIPT_PATH.with_name("policy.json")
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "deny": 3}
@@ -689,7 +689,18 @@ def emergency_stop(*, source: str) -> dict[str, Any]:
 
 def cmd_doctor(_: argparse.Namespace) -> None:
     discover_session_env()
-    commands = ["niri", "grim", "wtype", "ydotool", "xdotool", "fuzzel", "notify-send", "footclient", "pkill"]
+    commands = [
+        "niri",
+        "grim",
+        "wtype",
+        "ydotool",
+        "xdotool",
+        "wl-copy",
+        "fuzzel",
+        "notify-send",
+        "footclient",
+        "pkill",
+    ]
     found = {name: shutil.which(name) for name in commands}
     niri_ok = False
     niri_error = ""
@@ -1207,6 +1218,79 @@ def cmd_x11_click(args: argparse.Namespace) -> None:
         restore_ready_after_action()
 
 
+def cmd_x11_key(args: argparse.Namespace) -> None:
+    modifiers, key = parse_hotkey(args.combo)
+    normalized = "+".join([*modifiers, key])
+    target = f"window id {args.window_id}" if args.window_id else f"first X11 window named {args.window_name!r}"
+    base_risk = args.risk or "medium"
+    if normalized.lower() in {"return", "ctrl+return", "alt+f4", "ctrl+w", "shift+delete", "ctrl+shift+return"}:
+        base_risk = risk_max(base_risk, "high")
+    risk, _ = prepare_action(
+        kind="x11-key",
+        requested_risk=base_risk,
+        reason=args.reason or f"press {normalized} in the specified XWayland window",
+        detail=f"activate {target} and press hotkey {normalized}",
+    )
+    try:
+        if not shutil.which("xdotool"):
+            raise AIUIError("xdotool is not in PATH", code=29)
+        window_id = resolve_x11_window(args)
+        argv = ["xdotool", "windowactivate", "--sync", window_id, "key", "--window", window_id, normalized]
+        cp = run_external(argv, timeout=20)
+        if cp.returncode != 0:
+            raise AIUIError("xdotool x11-key failed", code=29, details={"stderr": cp.stderr.strip(), "argv": argv})
+        log_event("x11_key", window_id=window_id, combo=normalized, risk=risk, reason=args.reason)
+        emit({"ok": True, "window_id": window_id, "combo": normalized, "risk": risk})
+    finally:
+        restore_ready_after_action()
+
+
+def cmd_x11_paste(args: argparse.Namespace) -> None:
+    text = sys.stdin.read() if args.stdin else (args.text or "")
+    if not text:
+        raise AIUIError("text input is empty", code=30)
+    policy = load_policy()
+    protected_content = regex_matches(policy.get("deny_content_patterns", []), text)
+    base_risk = args.risk or "medium"
+    if protected_content:
+        base_risk = "deny"
+    if len(text) > 500:
+        base_risk = risk_max(base_risk, "high")
+    target = f"window id {args.window_id}" if args.window_id else f"first X11 window named {args.window_name!r}"
+    detail = f"copy {len(text)} characters to the clipboard and paste them into {target}"
+    if protected_content:
+        detail += f"; text matches protected-content policy: {protected_content}"
+    risk, _ = prepare_action(
+        kind="x11-paste",
+        requested_risk=base_risk,
+        reason=args.reason or "paste text into the specified XWayland window",
+        detail=detail,
+    )
+    try:
+        if not shutil.which("wl-copy"):
+            raise AIUIError("wl-copy is not in PATH", code=30)
+        if not shutil.which("xdotool"):
+            raise AIUIError("xdotool is not in PATH", code=30)
+        window_id = resolve_x11_window(args)
+        copy = run_external(["wl-copy", "--trim-newline", "--", text], timeout=10)
+        if copy.returncode != 0:
+            raise AIUIError("wl-copy failed", code=30, details={"stderr": copy.stderr.strip()})
+        paste = run_external(["xdotool", "windowactivate", "--sync", window_id, "key", "--window", window_id, "ctrl+v"], timeout=20)
+        if paste.returncode != 0:
+            raise AIUIError("xdotool paste hotkey failed", code=30, details={"stderr": paste.stderr.strip()})
+        log_event(
+            "x11_paste",
+            window_id=window_id,
+            chars=len(text),
+            sha256=hashlib.sha256(text.encode()).hexdigest(),
+            risk=risk,
+            reason=args.reason,
+        )
+        emit({"ok": True, "window_id": window_id, "chars": len(text), "risk": risk})
+    finally:
+        restore_ready_after_action()
+
+
 def cmd_niri_action(args: argparse.Namespace) -> None:
     action_argv: list[str]
     default_risk = "low"
@@ -1430,6 +1514,24 @@ def build_parser() -> argparse.ArgumentParser:
     x11_click.add_argument("--button", choices=["left", "right", "middle"], default="left")
     add_risk_arguments(x11_click)
     x11_click.set_defaults(func=cmd_x11_click)
+
+    x11_key = sub.add_parser("x11-key", help="press a key combination in an X11/XWayland window")
+    target = x11_key.add_mutually_exclusive_group(required=True)
+    target.add_argument("--window-id")
+    target.add_argument("--window-name")
+    x11_key.add_argument("combo")
+    add_risk_arguments(x11_key)
+    x11_key.set_defaults(func=cmd_x11_key)
+
+    x11_paste = sub.add_parser("x11-paste", help="paste UTF-8 text into an X11/XWayland window")
+    target = x11_paste.add_mutually_exclusive_group(required=True)
+    target.add_argument("--window-id")
+    target.add_argument("--window-name")
+    source = x11_paste.add_mutually_exclusive_group(required=True)
+    source.add_argument("--text")
+    source.add_argument("--stdin", action="store_true")
+    add_risk_arguments(x11_paste)
+    x11_paste.set_defaults(func=cmd_x11_paste)
 
     niri_action = sub.add_parser("niri-action")
     niri_action.add_argument("action", choices=["focus-window", "focus-workspace", "toggle-overview", "close-window"])

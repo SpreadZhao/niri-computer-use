@@ -264,6 +264,9 @@ $XDG_STATE_HOME/aiui/audit.jsonl       persistent redacted audit events
   hold the runtime in `acting`.
 - XWayland-only targets can be clicked with `aiui x11-click --window-name ...`
   using window-relative coordinates while still going through aiui policy.
+- XWayland-only text fields can use `aiui x11-key ...` and
+  `aiui x11-paste ...` when the Wayland keyboard path does not match the
+  target application's input method.
 - Privilege escalation and disk-management commands are denied by policy.
 - Unknown CLI programs default to high risk.
 

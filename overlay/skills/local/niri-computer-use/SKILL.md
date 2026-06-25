@@ -132,6 +132,19 @@ window-relative coordinates through `x11-click`:
   --risk medium
 ```
 
+For X11/XWayland windows where the Wayland keyboard path is unreliable, use
+`x11-key` for shortcuts and `x11-paste` for text:
+
+```bash
+"$AIUI" x11-key --window-name Weixin ctrl+a \
+  --reason 'Select the visible text in the XWayland input field' \
+  --risk medium
+
+"$AIUI" x11-paste --window-name Weixin --text 'test message' \
+  --reason 'Paste prepared text into the XWayland input field' \
+  --risk medium
+```
+
 ### Close a window
 
 ```bash
